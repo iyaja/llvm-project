@@ -28,7 +28,7 @@ them to build a custom JIT that is suited to your use-case.
 
 The structure of the tutorial is:
 
-- Chapter #1: Investigate the simple KaleidoscopeJIT class. This will
+- `Chapter #1 <BuildingAJIT1.html>`_: Investigate the simple KaleidoscopeJIT class. This will
   introduce some of the basic concepts of the ORC JIT APIs, including the
   idea of an ORC *Layer*.
 
@@ -127,50 +127,60 @@ usual include guards and #includes [2]_, we get to the definition of our class:
 
   class KaleidoscopeJIT {
   private:
-    ExecutionSession ES;
-    RTDyldObjectLinkingLayer ObjectLayer;
-    IRCompileLayer CompileLayer;
+    std::unique_ptr<ExecutorProcessControl> EPC;
+    std::unique_ptr<ExecutionSession> ES;
 
     DataLayout DL;
     MangleAndInterner Mangle;
-    ThreadSafeContext Ctx;
+
+    RTDyldObjectLinkingLayer ObjectLayer;
+    IRCompileLayer CompileLayer;
+
+    JITDylib &MainJD;
 
   public:
-    KaleidoscopeJIT(JITTargetMachineBuilder JTMB, DataLayout DL)
-        : ObjectLayer(ES,
+    KaleidoscopeJIT(std::unique_ptr<ExecutorProcessControl> EPC,
+                    std::unique_ptr<ExecutionSession> ES,
+                    JITTargetMachineBuilder JTMB, DataLayout DL)
+        : EPC(std::move(EPC)), ES(std::move(ES)), DL(std::move(DL)),
+          Mangle(*this->ES, this->DL),
+          ObjectLayer(*this->ES,
                       []() { return std::make_unique<SectionMemoryManager>(); }),
-          CompileLayer(ES, ObjectLayer, ConcurrentIRCompiler(std::move(JTMB))),
-          DL(std::move(DL)), Mangle(ES, this->DL),
-          Ctx(std::make_unique<LLVMContext>()) {
-      ES.getMainJITDylib().addGenerator(
-          cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(DL.getGlobalPrefix())));
+          CompileLayer(*this->ES, ObjectLayer,
+                      std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
+          MainJD(this->ES->createBareJITDylib("<main>")) {
+      MainJD.addGenerator(
+          cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
+              DL.getGlobalPrefix())));
     }
 
-Our class begins with six member variables: An ExecutionSession member, ``ES``,
-which provides context for our running JIT'd code (including the string pool,
-global mutex, and error reporting facilities); An RTDyldObjectLinkingLayer,
-``ObjectLayer``, that can be used to add object files to our JIT (though we will
-not use it directly); An IRCompileLayer, ``CompileLayer``, that can be used to
-add LLVM Modules to our JIT (and which builds on the ObjectLayer), A DataLayout
-and MangleAndInterner, ``DL`` and ``Mangle``, that will be used for symbol mangling
-(more on that later); and finally an LLVMContext that clients will use when
-building IR files for the JIT.
+Our class begins with seven member variables:
+1. An ExecutionProcessCOntrol, ``EPC``,
+2. An ExecutionSession member, ``ES``, which provides context for our running
+JIT'd code (including the string pool global mutex, and error reporting facilities).
+3. An RTDyldObjectLinkingLayer, ``ObjectLayer``, that can be used to add object files to our JIT (though we will not use it directly)
+4. An IRCompileLayer, ``CompileLayer``, that can be used to add LLVM Modules to our JIT (and which builds on the ObjectLayer).
+5. A DataLayout ``DL`` that will be used for symbol mangling (more on that later).
+6. A MangleAndInterner, ``Mangle``, that will be used along with ``DL`` for symbol mangling.
+7. An LLVMContext that clients will use when building IR files for the JIT.
 
-Next up we have our class constructor, which takes a `JITTargetMachineBuilder``
-that will be used by our IRCompiler, and a ``DataLayout`` that we will use to
+Next up we have our class constructor, which takes a ``JITTargetMachineBuilder``
+that will be used by our ``IRCompiler``, and a ``DataLayout`` that we will use to
 initialize our DL member. The constructor begins by initializing our
-ObjectLayer.  The ObjectLayer requires a reference to the ExecutionSession, and
+``ObjectLayer``.  The ``ObjectLayer`` requires a reference to the ``ExecutionSession``, and
 a function object that will build a JIT memory manager for each module that is
 added (a JIT memory manager manages memory allocations, memory permissions, and
 registration of exception handlers for JIT'd code). For this we use a lambda
-that returns a SectionMemoryManager, an off-the-shelf utility that provides all
+that returns a ``SectionMemoryManager``, an off-the-shelf utility that provides all
 the basic memory management functionality required for this chapter. Next we
-initialize our CompileLayer. The CompileLayer needs three things: (1) A
-reference to the ExecutionSession, (2) A reference to our object layer, and (3)
-a compiler instance to use to perform the actual compilation from IR to object
-files. We use the off-the-shelf ConcurrentIRCompiler utility as our compiler,
-which we construct using this constructor's JITTargetMachineBuilder argument.
-The ConcurrentIRCompiler utility will use the JITTargetMachineBuilder to build
+initialize our ``CompileLayer``. The ``CompileLayer`` needs three things:
+1. A reference to the ``ExecutionSession``.
+2. A reference to our object layer, ``ObjectLayer``.
+3. A compiler instance to use to perform the actual compilation from IR to object
+files. We use the off-the-shelf ``ConcurrentIRCompiler`` utility as our compiler,
+which we construct using this constructor's ``JITTargetMachineBuilder`` argument.
+
+The ``ConcurrentIRCompiler`` utility will use the ``JITTargetMachineBuilder`` to build
 llvm TargetMachines (which are not thread safe) as needed for compiles. After
 this, we initialize our supporting members: ``DL``, ``Mangler`` and ``Ctx`` with
 the input DataLayout, the ExecutionSession and DL member, and a new default
@@ -186,69 +196,66 @@ REPL process as well. We do this by attaching a
 .. code-block:: c++
 
   static Expected<std::unique_ptr<KaleidoscopeJIT>> Create() {
-    auto JTMB = JITTargetMachineBuilder::detectHost();
+    auto SSP = std::make_shared<SymbolStringPool>();
+    auto EPC = SelfExecutorProcessControl::Create(SSP);
+    if (!EPC)
+      return EPC.takeError();
 
-    if (!JTMB)
-      return JTMB.takeError();
+    auto ES = std::make_unique<ExecutionSession>(std::move(SSP));
 
-    auto DL = JTMB->getDefaultDataLayoutForTarget();
+    JITTargetMachineBuilder JTMB((*EPC)->getTargetTriple());
+
+    auto DL = JTMB.getDefaultDataLayoutForTarget();
     if (!DL)
       return DL.takeError();
 
-    return std::make_unique<KaleidoscopeJIT>(std::move(*JTMB), std::move(*DL));
+    return std::make_unique<KaleidoscopeJIT>(std::move(*EPC), std::move(ES),
+                                             std::move(JTMB), std::move(*DL));
   }
-
-  const DataLayout &getDataLayout() const { return DL; }
-
-  LLVMContext &getContext() { return *Ctx.getContext(); }
 
 Next we have a named constructor, ``Create``, which will build a KaleidoscopeJIT
 instance that is configured to generate code for our host process. It does this
-by first generating a JITTargetMachineBuilder instance using that classes'
-detectHost method and then using that instance to generate a datalayout for
+by first constructing a JITTargetMachineBuilder instance using ``ExecutorProcessControl`` 's
+``getTargetTriple`` method and then using that instance to generate a datalayout for
 the target process. Each of these operations can fail, so each returns its
 result wrapped in an Expected value [3]_ that we must check for error before
 continuing. If both operations succeed we can unwrap their results (using the
 dereference operator) and pass them into KaleidoscopeJIT's constructor on the
 last line of the function.
 
-Following the named constructor we have the ``getDataLayout()`` and
-``getContext()`` methods. These are used to make data structures created and
-managed by the JIT (especially the LLVMContext) available to the REPL code that
-will build our IR modules.
+Following the named constructor we have the ``getDataLayout()`` method.
+This is used to make data structures created and managed by the JIT
+(especially the LLVMContext) available to the REPL code that will build our
+IR modules.
 
 .. code-block:: c++
 
-  void addModule(std::unique_ptr<Module> M) {
-    cantFail(CompileLayer.add(ES.getMainJITDylib(),
-                              ThreadSafeModule(std::move(M), Ctx)));
+  Error addModule(ThreadSafeModule TSM, ResourceTrackerSP RT = nullptr) {
+    if (!RT)
+      RT = MainJD.getDefaultResourceTracker();
+    return CompileLayer.add(RT, std::move(TSM));
   }
 
   Expected<JITEvaluatedSymbol> lookup(StringRef Name) {
-    return ES.lookup({&ES.getMainJITDylib()}, Mangle(Name.str()));
+    return ES->lookup({&MainJD}, Mangle(Name.str()));
   }
 
-Now we come to the first of our JIT API methods: addModule. This method is
+Now we come to the first of our JIT API methods: ``addModule``. This method is
 responsible for adding IR to the JIT and making it available for execution. In
 this initial implementation of our JIT we will make our modules "available for
-execution" by adding them to the CompileLayer, which will it turn store the
+execution" by adding them to the ``CompileLayer``, which will in turn store the
 Module in the main JITDylib. This process will create new symbol table entries
 in the JITDylib for each definition in the module, and will defer compilation of
 the module until any of its definitions is looked up. Note that this is not lazy
 compilation: just referencing a definition, even if it is never used, will be
 enough to trigger compilation. In later chapters we will teach our JIT to defer
-compilation of functions until they're actually called.  To add our Module we
-must first wrap it in a ThreadSafeModule instance, which manages the lifetime of
-the Module's LLVMContext (our Ctx member) in a thread-friendly way. In our
-example, all modules will share the Ctx member, which will exist for the
-duration of the JIT. Once we switch to concurrent compilation in later chapters
-we will use a new context per module.
+compilation of functions until they're actually called.
 
 Our last method is ``lookup``, which allows us to look up addresses for
 function and variable definitions added to the JIT based on their symbol names.
 As noted above, lookup will implicitly trigger compilation for any symbol
 that has not already been compiled. Our lookup method calls through to
-`ExecutionSession::lookup`, passing in a list of dylibs to search (in our case
+``ExecutionSession::lookup``, passing in a list of dylibs to search (in our case
 just the main dylib), and the symbol name to search for, with a twist: We have
 to *mangle* the name of the symbol we're searching for first. The ORC JIT
 components use mangled symbols internally the same way a static compiler and
