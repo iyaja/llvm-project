@@ -58,26 +58,33 @@ apply to each Module that is added via addModule:
 
   class KaleidoscopeJIT {
   private:
-    ExecutionSession ES;
-    RTDyldObjectLinkingLayer ObjectLayer;
-    IRCompileLayer CompileLayer;
-    IRTransformLayer TransformLayer;
+    std::unique_ptr<ExecutorProcessControl> EPC;
+    std::unique_ptr<ExecutionSession> ES;
 
     DataLayout DL;
     MangleAndInterner Mangle;
-    ThreadSafeContext Ctx;
+
+    RTDyldObjectLinkingLayer ObjectLayer;
+    IRCompileLayer CompileLayer;
+    IRTransformLayer OptimizeLayer;
+
+    JITDylib &MainJD;
 
   public:
-
-    KaleidoscopeJIT(JITTargetMachineBuilder JTMB, DataLayout DL)
-        : ObjectLayer(ES,
+    KaleidoscopeJIT(std::unique_ptr<ExecutorProcessControl> EPC,
+                    std::unique_ptr<ExecutionSession> ES,
+                    JITTargetMachineBuilder JTMB, DataLayout DL)
+        : EPC(std::move(EPC)), ES(std::move(ES)), DL(std::move(DL)),
+          Mangle(*this->ES, this->DL),
+          ObjectLayer(*this->ES,
                       []() { return std::make_unique<SectionMemoryManager>(); }),
-          CompileLayer(ES, ObjectLayer, ConcurrentIRCompiler(std::move(JTMB))),
-          TransformLayer(ES, CompileLayer, optimizeModule),
-          DL(std::move(DL)), Mangle(ES, this->DL),
-          Ctx(std::make_unique<LLVMContext>()) {
-      ES.getMainJITDylib().addGenerator(
-          cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(DL.getGlobalPrefix())));
+          CompileLayer(*this->ES, ObjectLayer,
+                      std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
+          OptimizeLayer(*this->ES, CompileLayer, optimizeModule),
+          MainJD(this->ES->createBareJITDylib("<main>")) {
+      MainJD.addGenerator(
+          cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
+              DL.getGlobalPrefix())));
     }
 
 Our extended KaleidoscopeJIT class starts out the same as it did in Chapter 1,
@@ -99,24 +106,22 @@ Next we need to update our addModule method to replace the call to
 
 .. code-block:: c++
 
-  static Expected<ThreadSafeModule>
-  optimizeModule(ThreadSafeModule M, const MaterializationResponsibility &R) {
-    // Create a function pass manager.
-    auto FPM = std::make_unique<legacy::FunctionPassManager>(M.get());
+  static Expected<std::unique_ptr<KaleidoscopeJIT>> Create() {
+    auto SSP = std::make_shared<SymbolStringPool>();
+    auto EPC = SelfExecutorProcessControl::Create(SSP);
+    if (!EPC)
+      return EPC.takeError();
 
-    // Add some optimizations.
-    FPM->add(createInstructionCombiningPass());
-    FPM->add(createReassociatePass());
-    FPM->add(createGVNPass());
-    FPM->add(createCFGSimplificationPass());
-    FPM->doInitialization();
+    auto ES = std::make_unique<ExecutionSession>(std::move(SSP));
 
-    // Run the optimizations over all functions in the module being added to
-    // the JIT.
-    for (auto &F : *M)
-      FPM->run(F);
+    JITTargetMachineBuilder JTMB((*EPC)->getTargetTriple());
 
-    return M;
+    auto DL = JTMB.getDefaultDataLayoutForTarget();
+    if (!DL)
+      return DL.takeError();
+
+    return std::make_unique<KaleidoscopeJIT>(std::move(*EPC), std::move(ES),
+                                             std::move(JTMB), std::move(*DL));
   }
 
 At the bottom of our JIT we add a private method to do the actual optimization:
